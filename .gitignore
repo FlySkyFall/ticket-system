@@ -1,0 +1,6 @@
+node_modules/
+.env
+database/
+uploads/
+*.sqlite
+*.sqlite3

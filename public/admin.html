@@ -1,0 +1,77 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Админ-панель</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🔧 Админ-панель</h1>
+            <button id="logoutBtn" class="btn-logout">Выйти</button>
+        </div>
+        
+        <!-- Статистика -->
+        <div id="stats"></div>
+        
+        <!-- Панель фильтров -->
+        <div class="card filter-panel">
+            <h3>🔍 Фильтры и поиск</h3>
+            <div class="filter-row">
+                <div class="filter-group">
+                    <label>Статус:</label>
+                    <select id="filterStatus">
+                        <option value="all">Все</option>
+                        <option value="new">🟡 Новые</option>
+                        <option value="in_progress">🔵 В работе</option>
+                        <option value="completed">🟢 Выполнены</option>
+                        <option value="cancelled">🔴 Отменены</option>
+                    </select>
+                </div>
+                
+                <div class="filter-group">
+                    <label>Приоритет:</label>
+                    <select id="filterPriority">
+                        <option value="all">Все</option>
+                        <option value="high">🔴 Высокий</option>
+                        <option value="medium">🟡 Средний</option>
+                        <option value="low">🟢 Низкий</option>
+                    </select>
+                </div>
+                
+                <div class="filter-group">
+                    <label>Филиал:</label>
+                    <input type="text" id="filterBranch" placeholder="Название филиала...">
+                </div>
+                
+                <div class="filter-group search-group">
+                    <label>Поиск:</label>
+                    <input type="text" id="filterSearch" placeholder="Поиск по описанию...">
+                </div>
+            </div>
+            <div class="filter-buttons">
+                <button id="applyFilters" class="btn-filter">🔍 Применить фильтры</button>
+                <button id="resetFilters" class="btn-filter reset">🔄 Сбросить</button>
+                <button id="exportExcel" class="btn-filter export">📊 Экспорт в Excel</button>
+            </div>
+        </div>
+        
+        <!-- Список заявок -->
+        <div class="card">
+            <h3>📋 Все заявки <span id="ticketsCount"></span></h3>
+            <div id="ticketsList"></div>
+        </div>
+        
+        <!-- Управление филиалами (ПЕРЕМЕЩЕНО ВНИЗ) -->
+        <div class="card">
+            <h3>🏢 Настройка уведомлений для филиалов</h3>
+            <p style="font-size: 12px; color: #666; margin-bottom: 12px;">Укажите email для каждого филиала — заведующие будут получать уведомления об изменении статуса заявок.</p>
+            <div id="branchesList"></div>
+        </div>
+    </div>
+    
+    <script src="/app.js"></script>
+</body>
+</html>

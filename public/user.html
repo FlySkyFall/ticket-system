@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover">
+    <title>Заявки — Ваш филиал</title>
+    <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>📝 Мои заявки</h1>
+            <button id="logoutBtn" class="btn-logout">Выйти</button>
+        </div>
+        
+        <div class="user-info" id="userInfo"></div>
+        
+        <!-- Вкладки -->
+        <div class="tabs">
+            <button class="tab-btn active" data-tab="new">➕ Новая заявка</button>
+            <button class="tab-btn" data-tab="list">📋 Список заявок</button>
+        </div>
+        
+        <!-- Вкладка: Новая заявка -->
+        <div id="newTab" class="tab-content active">
+            <div class="card">
+                <form id="ticketForm">
+                    <div class="form-group">
+                        <label>📂 Тип проблемы *</label>
+                        <select id="category" required>
+                            <option value="computer">🖥️ Компьютер/ноутбук</option>
+                            <option value="printer">🖨️ Принтер/МФУ</option>
+                            <option value="network">🌐 Сеть/интернет</option>
+                            <option value="phone">📞 Телефония</option>
+                            <option value="electric">🔌 Электрика</option>
+                            <option value="furniture">🪑 Мебель/инвентарь</option>
+                            <option value="other">❓ Другое</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>⚡ Срочность *</label>
+                        <select id="priority" required>
+                            <option value="high">🔴 Высокая (всё встало, работа остановлена)</option>
+                            <option value="medium" selected>🟡 Средняя (работает с ограничениями)</option>
+                            <option value="low">🟢 Низкая (не срочно, можно в течение дня)</option>
+                        </select>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>📝 Описание проблемы *</label>
+                        <textarea id="problem" rows="4" placeholder="Опишите подробно, что случилось..."></textarea>
+                    </div>
+                    
+                    <div class="form-group">
+                        <label>📸 Фото (необязательно)</label>
+                        <input type="file" id="photo" accept="image/*" capture="environment">
+                        <small>Можно сделать фото прямо сейчас или выбрать из галереи</small>
+                    </div>
+                    
+                    <button type="submit" class="btn btn-primary">📤 Отправить заявку</button>
+                </form>
+                
+                <div id="successMessage" class="success-message"></div>
+                <div id="errorMessage" class="error-message"></div>
+            </div>
+        </div>
+        
+        <!-- Вкладка: Список заявок -->
+        <div id="listTab" class="tab-content">
+            <div class="card">
+                <div id="ticketsList"></div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/app.js"></script>
+</body>
+</html>
