@@ -2,10 +2,10 @@ require('dotenv').config();
 const express = require('express');
 const path = require('path');
 const fs = require('fs');
-const sqlite3 = require('sqlite3').verbose();
 const bcrypt = require('bcrypt');
 const jwt = require('jsonwebtoken');
 const multer = require('multer');
+const { MongoClient, ObjectId } = require('mongodb');
 const { sendNewTicketNotification, sendStatusChangeNotification } = require('./utils/mailer');
 const XLSX = require('xlsx');
 
@@ -13,14 +13,20 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 const JWT_SECRET = process.env.JWT_SECRET;
 
+// MongoDB подключение
+const MONGODB_URI = process.env.MONGODB_URI;
+const client = new MongoClient(MONGODB_URI);
+let db;
+let ticketsCollection;
+let branchesCollection;
+let commentsCollection;
+let historyCollection;
+
 // Создаём необходимые папки
-const folders = ['database', 'uploads', 'public'];
+const folders = ['uploads', 'public'];
 folders.forEach(folder => {
     if (!fs.existsSync(folder)) fs.mkdirSync(folder);
 });
-
-// В самом начале, после импортов
-const DATABASE_PATH = process.env.DATABASE_PATH || path.join(__dirname, 'database', 'tickets.db');
 
 // Middleware
 app.use(express.json());
@@ -28,172 +34,121 @@ app.use(express.urlencoded({ extended: true }));
 app.use(express.static('public'));
 app.use('/uploads', express.static('uploads'));
 
-// Инициализация базы данных
-const dbPath = path.join(__dirname, 'database', 'tickets.db');
-const db = new sqlite3.Database(dbPath);
+// Счётчик для числовых ID заявок (для совместимости с фронтендом)
+let ticketCounter = 1;
 
-// Функция для проверки существования колонки
-function columnExists(tableName, columnName, callback) {
-    db.all(`PRAGMA table_info(${tableName})`, (err, columns) => {
-        if (err) return callback(false);
-        const exists = columns.some(col => col.name === columnName);
-        callback(exists);
-    });
-}
-
-// Функция записи в историю
-function addToHistory(ticketId, action, oldValue, newValue, userName) {
-    db.run(`
-        INSERT INTO ticket_history (ticket_id, action, old_value, new_value, user_name, created_at)
-        VALUES (?, ?, ?, ?, ?, datetime('now'))
-    `, [ticketId, action, oldValue || null, newValue || null, userName], (err) => {
-        if (err) console.error('Ошибка записи в историю:', err.message);
-    });
-}
-
-// Создание/миграция таблиц
-db.serialize(() => {
-    // 1. Таблица branches (с email)
-    db.run(`
-        CREATE TABLE IF NOT EXISTS branches (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            name TEXT NOT NULL,
-            login TEXT UNIQUE NOT NULL,
-            password_hash TEXT NOT NULL,
-            email TEXT,
-            is_admin INTEGER DEFAULT 0
-        )
-    `);
-    
-    // 2. Таблица tickets
-    db.run(`
-        CREATE TABLE IF NOT EXISTS tickets (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            branch_id INTEGER NOT NULL,
-            branch_name TEXT NOT NULL,
-            problem TEXT NOT NULL,
-            photo_path TEXT,
-            status TEXT DEFAULT 'new',
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (branch_id) REFERENCES branches(id)
-        )
-    `);
-    
-    // Добавляем колонку category, если её нет
-    columnExists('tickets', 'category', (exists) => {
-        if (!exists) {
-            db.run(`ALTER TABLE tickets ADD COLUMN category TEXT DEFAULT 'other'`, (err) => {
-                if (err) console.log('⚠️ Не удалось добавить category:', err.message);
-                else console.log('✅ Добавлена колонка category');
-            });
-        }
-    });
-    
-    // Добавляем колонку priority, если её нет
-    columnExists('tickets', 'priority', (exists) => {
-        if (!exists) {
-            db.run(`ALTER TABLE tickets ADD COLUMN priority TEXT DEFAULT 'medium'`, (err) => {
-                if (err) console.log('⚠️ Не удалось добавить priority:', err.message);
-                else console.log('✅ Добавлена колонка priority');
-            });
-        }
-    });
-    
-    // 3. Таблица комментариев
-    db.run(`
-        CREATE TABLE IF NOT EXISTS comments (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id INTEGER NOT NULL,
-            user_name TEXT NOT NULL,
-            comment TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (ticket_id) REFERENCES tickets(id)
-        )
-    `);
-    
-    // 4. Таблица истории изменений
-    db.run(`
-        CREATE TABLE IF NOT EXISTS ticket_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            ticket_id INTEGER NOT NULL,
-            action TEXT NOT NULL,
-            old_value TEXT,
-            new_value TEXT,
-            user_name TEXT NOT NULL,
-            created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY (ticket_id) REFERENCES tickets(id)
-        )
-    `);
-    
-    // 5. Добавляем тестовые филиалы (только если таблица пустая)
-    db.get(`SELECT COUNT(*) as count FROM branches`, (err, row) => {
-        if (row && row.count === 0) {
-            const testBranches = [
-                ['Филиал Северный', 'sever', bcrypt.hashSync('12345', 10), 'sever@example.ru', 0],
-                ['Филиал Южный', 'ug', bcrypt.hashSync('12345', 10), 'ug@example.ru', 0],
-                ['Филиал Восточный', 'vostok', bcrypt.hashSync('12345', 10), 'vostok@example.ru', 0],
-                ['Филиал Западный', 'zapad', bcrypt.hashSync('12345', 10), 'zapad@example.ru', 0],
-                ['Филиал Центральный', 'center', bcrypt.hashSync('12345', 10), 'center@example.ru', 0],
-                ['Администратор', 'admin', bcrypt.hashSync('admin123', 10), null, 1]
-            ];
-            
-            const stmt = db.prepare(`INSERT INTO branches (name, login, password_hash, email, is_admin) VALUES (?, ?, ?, ?, ?)`);
-            testBranches.forEach(b => stmt.run(b));
-            stmt.finalize();
-            
-            console.log('✅ Добавлены тестовые филиалы');
-            console.log('👤 Администратор: admin / admin123');
-            console.log('🏢 Филиалы: sever, ug, vostok, zapad, center (пароль 12345)');
-        } else {
-            console.log('📁 База данных уже существует, пропускаем создание тестовых филиалов');
-        }
-    });
-});
-
-// ============ API ЭНДПОИНТЫ ============
-
-// Логин
-app.post('/api/login', (req, res) => {
-    const { login, password } = req.body;
-    
-    if (!login || !password) {
-        return res.status(400).json({ error: 'Введите логин и пароль' });
-    }
-    
-    db.get(`SELECT * FROM branches WHERE login = ?`, [login], (err, branch) => {
-        if (err || !branch) {
-            return res.status(401).json({ error: 'Неверный логин или пароль' });
+// ============ ФУНКЦИЯ ПОДКЛЮЧЕНИЯ К MONGODB ============
+async function connectDB() {
+    try {
+        await client.connect();
+        db = client.db('ticket_system');
+        ticketsCollection = db.collection('tickets');
+        branchesCollection = db.collection('branches');
+        commentsCollection = db.collection('comments');
+        historyCollection = db.collection('history');
+        
+        console.log('✅ Подключено к MongoDB Atlas');
+        
+        // Создаём индексы
+        await ticketsCollection.createIndex({ numeric_id: 1 }, { unique: true });
+        await ticketsCollection.createIndex({ branch_id: 1 });
+        await ticketsCollection.createIndex({ status: 1 });
+        await branchesCollection.createIndex({ login: 1 }, { unique: true });
+        
+        // Получаем текущий максимальный numeric_id
+        const lastTicket = await ticketsCollection.findOne({}, { sort: { numeric_id: -1 } });
+        if (lastTicket && lastTicket.numeric_id) {
+            ticketCounter = lastTicket.numeric_id + 1;
         }
         
-        bcrypt.compare(password, branch.password_hash, (err, result) => {
-            if (err || !result) {
-                return res.status(401).json({ error: 'Неверный логин или пароль' });
-            }
-            
-            const token = jwt.sign(
-                { 
-                    id: branch.id, 
-                    login: branch.login, 
-                    name: branch.name,
-                    email: branch.email,
-                    isAdmin: branch.is_admin === 1 
-                },
-                JWT_SECRET,
-                { expiresIn: '30d' }
-            );
-            
-            res.json({
-                token,
-                user: {
-                    id: branch.id,
-                    name: branch.name,
-                    email: branch.email,
-                    isAdmin: branch.is_admin === 1
-                }
-            });
+        // Создаём пользователей
+        await createUsers();
+        
+    } catch (err) {
+        console.error('❌ Ошибка подключения к MongoDB:', err);
+        process.exit(1);
+    }
+}
+
+// ============ СОЗДАНИЕ ПОЛЬЗОВАТЕЛЕЙ ============
+async function createUsers() {
+    const userCount = await branchesCollection.countDocuments();
+    if (userCount > 0) {
+        console.log(`📁 Пользователи уже существуют (${userCount} записей)`);
+        return;
+    }
+    
+    // 2 Администратора
+    const admins = [
+        {
+            name: 'Главный администратор',
+            login: 'admin',
+            password_hash: await bcrypt.hash('admin123', 10),
+            email: null,
+            is_admin: 1,
+            created_at: new Date()
+        },
+        {
+            name: 'Второй администратор',
+            login: 'admin2',
+            password_hash: await bcrypt.hash('admin123', 10),
+            email: null,
+            is_admin: 1,
+            created_at: new Date()
+        }
+    ];
+    
+    // 11 Филиалов
+    const branches = [
+        { name: 'Филиал Северный', login: 'sever', password: '12345', email: 'sever@example.ru' },
+        { name: 'Филиал Южный', login: 'ug', password: '12345', email: 'ug@example.ru' },
+        { name: 'Филиал Восточный', login: 'vostok', password: '12345', email: 'vostok@example.ru' },
+        { name: 'Филиал Западный', login: 'zapad', password: '12345', email: 'zapad@example.ru' },
+        { name: 'Филиал Центральный', login: 'center', password: '12345', email: 'center@example.ru' },
+        { name: 'Филиал Северо-Западный', login: 'sever_zapad', password: '12345', email: 'sever_zapad@example.ru' },
+        { name: 'Филиал Северо-Восточный', login: 'sever_vostok', password: '12345', email: 'sever_vostok@example.ru' },
+        { name: 'Филиал Юго-Западный', login: 'ug_zapad', password: '12345', email: 'ug_zapad@example.ru' },
+        { name: 'Филиал Юго-Восточный', login: 'ug_vostok', password: '12345', email: 'ug_vostok@example.ru' },
+        { name: 'Филиал Подольский', login: 'podolsk', password: '12345', email: 'podolsk@example.ru' },
+        { name: 'Филиал Красногорский', login: 'krasnogorsk', password: '12345', email: 'krasnogorsk@example.ru' }
+    ];
+    
+    const branchUsers = [];
+    for (const branch of branches) {
+        branchUsers.push({
+            name: branch.name,
+            login: branch.login,
+            password_hash: await bcrypt.hash(branch.password, 10),
+            email: branch.email,
+            is_admin: 0,
+            created_at: new Date()
         });
-    });
-});
+    }
+    
+    const allUsers = [...admins, ...branchUsers];
+    await branchesCollection.insertMany(allUsers);
+    
+    console.log('✅ Созданы пользователи:');
+    console.log(`   👤 Администраторы: admin/admin123, admin2/admin123`);
+    console.log(`   🏢 ${branches.length} филиалов (пароль: 12345)`);
+}
+
+// ============ ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ ============
+async function addToHistory(ticketId, action, oldValue, newValue, userName, comment = null) {
+    try {
+        await historyCollection.insertOne({
+            ticket_numeric_id: ticketId,
+            action,
+            old_value: oldValue,
+            new_value: newValue,
+            user_name: userName,
+            comment: comment,
+            created_at: new Date()
+        });
+    } catch (err) {
+        console.error('Ошибка записи в историю:', err);
+    }
+}
 
 // Middleware для проверки токена
 function authMiddleware(req, res, next) {
@@ -226,13 +181,63 @@ const storage = multer.diskStorage({
         cb(null, unique + path.extname(file.originalname));
     }
 });
-const upload = multer({ 
+const upload = multer({
     storage: storage,
-    limits: { fileSize: 5 * 1024 * 1024 } // 5 MB
+    limits: { fileSize: 5 * 1024 * 1024 }
+});
+
+// ============ API ЭНДПОИНТЫ ============
+
+// Логин
+app.post('/api/login', async (req, res) => {
+    const { login, password } = req.body;
+    
+    if (!login || !password) {
+        return res.status(400).json({ error: 'Введите логин и пароль' });
+    }
+    
+    try {
+        const branch = await branchesCollection.findOne({ login: login });
+        
+        if (!branch) {
+            return res.status(401).json({ error: 'Неверный логин или пароль' });
+        }
+        
+        const isValid = await bcrypt.compare(password, branch.password_hash);
+        if (!isValid) {
+            return res.status(401).json({ error: 'Неверный логин или пароль' });
+        }
+        
+        const token = jwt.sign(
+            {
+                id: branch._id.toString(),
+                numeric_id: branch.numeric_id || 0,
+                login: branch.login,
+                name: branch.name,
+                email: branch.email,
+                isAdmin: branch.is_admin === 1
+            },
+            JWT_SECRET,
+            { expiresIn: '30d' }
+        );
+        
+        res.json({
+            token,
+            user: {
+                id: branch._id.toString(),
+                name: branch.name,
+                email: branch.email,
+                isAdmin: branch.is_admin === 1
+            }
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка сервера' });
+    }
 });
 
 // Создание новой заявки
-app.post('/api/tickets', authMiddleware, upload.single('photo'), (req, res) => {
+app.post('/api/tickets', authMiddleware, upload.single('photo'), async (req, res) => {
     const { problem, category, priority } = req.body;
     const branch_id = req.user.id;
     const branch_name = req.user.name;
@@ -244,319 +249,344 @@ app.post('/api/tickets', authMiddleware, upload.single('photo'), (req, res) => {
     
     const finalCategory = category || 'other';
     const finalPriority = priority || 'medium';
+    const numericId = ticketCounter++;
     
-    db.run(`
-        INSERT INTO tickets (branch_id, branch_name, category, priority, problem, photo_path, status)
-        VALUES (?, ?, ?, ?, ?, ?, 'new')
-    `, [branch_id, branch_name, finalCategory, finalPriority, problem, photo_path], function(err) {
-        if (err) {
-            console.error(err);
-            return res.status(500).json({ error: 'Ошибка при создании заявки' });
-        }
+    try {
+        const ticket = {
+            numeric_id: numericId,
+            branch_id: branch_id,
+            branch_name: branch_name,
+            category: finalCategory,
+            priority: finalPriority,
+            problem: problem,
+            photo_path: photo_path,
+            status: 'new',
+            created_at: new Date()
+        };
         
-        const ticketId = this.lastID;
+        const result = await ticketsCollection.insertOne(ticket);
         
         // Записываем в историю
-        addToHistory(ticketId, 'create', null, JSON.stringify({ problem, finalCategory, finalPriority }), branch_name);
+        await addToHistory(numericId, 'create', null, JSON.stringify({ problem, finalCategory, finalPriority }), branch_name);
         
-        // Получаем полные данные заявки для отправки уведомления
-        db.get(`SELECT * FROM tickets WHERE id = ?`, [ticketId], async (err, ticket) => {
-            if (!err && ticket) {
-                await sendNewTicketNotification(ticket, branch_name);
-            }
-        });
+        // Отправляем уведомление
+        const ticketForNotify = { ...ticket, id: numericId };
+        await sendNewTicketNotification(ticketForNotify, branch_name);
         
         res.json({
-            id: ticketId,
+            id: numericId,
             message: 'Заявка создана',
             status: 'new'
         });
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка при создании заявки' });
+    }
 });
 
 // Получение заявок (с фильтрацией)
-app.get('/api/tickets', authMiddleware, (req, res) => {
+app.get('/api/tickets', authMiddleware, async (req, res) => {
     const { status, priority, branch, search } = req.query;
-    let query = `SELECT * FROM tickets`;
-    let params = [];
-    let conditions = [];
+    let filter = {};
     
-    // Для обычного пользователя — только свои заявки
     if (!req.user.isAdmin) {
-        conditions.push(`branch_id = ?`);
-        params.push(req.user.id);
+        filter.branch_id = req.user.id;
     }
     
-    // Фильтр по статусу
     if (status && status !== 'all') {
-        conditions.push(`status = ?`);
-        params.push(status);
+        filter.status = status;
     }
     
-    // Фильтр по приоритету
     if (priority && priority !== 'all') {
-        conditions.push(`priority = ?`);
-        params.push(priority);
+        filter.priority = priority;
     }
     
-    // Фильтр по филиалу (только для админа)
     if (branch && branch.trim() && req.user.isAdmin) {
-        conditions.push(`branch_name LIKE ?`);
-        params.push(`%${branch}%`);
+        filter.branch_name = { $regex: branch, $options: 'i' };
     }
     
-    // Поиск по тексту проблемы
     if (search && search.trim()) {
-        conditions.push(`problem LIKE ?`);
-        params.push(`%${search}%`);
+        filter.problem = { $regex: search, $options: 'i' };
     }
     
-    if (conditions.length) {
-        query += ` WHERE ` + conditions.join(' AND ');
+    try {
+        let tickets = await ticketsCollection.find(filter).toArray();
+        
+        // Сортировка
+        const priorityOrder = { 'high': 1, 'medium': 2, 'low': 3 };
+        tickets.sort((a, b) => {
+            const priorityCompare = priorityOrder[a.priority] - priorityOrder[b.priority];
+            if (priorityCompare !== 0) return priorityCompare;
+            return new Date(b.created_at) - new Date(a.created_at);
+        });
+        
+        // Преобразуем для фронтенда: id = numeric_id
+        const ticketsWithId = tickets.map(t => ({
+            id: t.numeric_id,
+            branch_id: t.branch_id,
+            branch_name: t.branch_name,
+            category: t.category,
+            priority: t.priority,
+            problem: t.problem,
+            photo_path: t.photo_path,
+            status: t.status,
+            created_at: t.created_at
+        }));
+        
+        res.json(ticketsWithId);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка получения заявок' });
     }
-    
-    // Сортировка: сначала по приоритету, потом по дате
-    query += ` ORDER BY 
-        CASE priority 
-            WHEN 'high' THEN 1 
-            WHEN 'medium' THEN 2 
-            WHEN 'low' THEN 3 
-        END, created_at DESC`;
-    
-    db.all(query, params, (err, tickets) => {
-        if (err) {
-            console.error(err);
-            return res.status(500).json({ error: 'Ошибка получения заявок' });
-        }
-        res.json(tickets);
-    });
 });
 
 // Обновление статуса заявки
-app.put('/api/tickets/:id/status', authMiddleware, (req, res) => {
+app.put('/api/tickets/:id/status', authMiddleware, async (req, res) => {
     if (!req.user.isAdmin) {
         return res.status(403).json({ error: 'Доступ запрещён' });
     }
     
     const { status, comment } = req.body;
     const validStatuses = ['new', 'in_progress', 'completed', 'cancelled'];
+    const ticketNumericId = parseInt(req.params.id);
     
     if (!validStatuses.includes(status)) {
         return res.status(400).json({ error: 'Неверный статус' });
     }
     
-    // Сначала получаем старый статус и данные заявки
-    db.get(`SELECT * FROM tickets WHERE id = ?`, [req.params.id], async (err, ticket) => {
-        if (err || !ticket) {
+    try {
+        const ticket = await ticketsCollection.findOne({ numeric_id: ticketNumericId });
+        
+        if (!ticket) {
             return res.status(404).json({ error: 'Заявка не найдена' });
         }
         
         const oldStatus = ticket.status;
         
-        // Обновляем статус
-        db.run(`UPDATE tickets SET status = ? WHERE id = ?`, [status, req.params.id], async function(err) {
-            if (err) {
-                return res.status(500).json({ error: 'Ошибка обновления' });
+        await ticketsCollection.updateOne(
+            { numeric_id: ticketNumericId },
+            { $set: { status } }
+        );
+        
+        await addToHistory(ticketNumericId, 'status_change', oldStatus, status, req.user.name);
+        
+        if (comment && comment.trim()) {
+            await commentsCollection.insertOne({
+                ticket_numeric_id: ticketNumericId,
+                user_name: req.user.name,
+                comment: comment,
+                created_at: new Date()
+            });
+            await addToHistory(ticketNumericId, 'comment', null, comment, req.user.name);
+        }
+        
+        // Отправляем уведомление
+        if (ticket.branch_id) {
+            const branch = await branchesCollection.findOne({ _id: new ObjectId(ticket.branch_id) });
+            if (branch && branch.email) {
+                const ticketForNotify = { ...ticket, id: ticketNumericId };
+                await sendStatusChangeNotification(ticketForNotify, ticket.branch_name, branch.email, oldStatus, status, comment);
             }
-            
-            // Записываем в историю
-            addToHistory(req.params.id, 'status_change', oldStatus, status, req.user.name);
-            
-            // Если есть комментарий, сохраняем его
-            if (comment && comment.trim()) {
-                db.run(`INSERT INTO comments (ticket_id, user_name, comment) VALUES (?, ?, ?)`,
-                    [req.params.id, req.user.name, comment]);
-                addToHistory(req.params.id, 'comment', null, comment, req.user.name);
-            }
-            
-            // Отправляем уведомление заведующей, если у неё есть email
-            if (ticket.branch_id) {
-                db.get(`SELECT email FROM branches WHERE id = ?`, [ticket.branch_id], async (err, branch) => {
-                    if (!err && branch && branch.email) {
-                        await sendStatusChangeNotification(ticket, ticket.branch_name, branch.email, oldStatus, status, comment);
-                    }
-                });
-            }
-            
-            res.json({ message: 'Статус обновлён' });
-        });
-    });
+        }
+        
+        res.json({ message: 'Статус обновлён' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка обновления' });
+    }
 });
 
 // Получение комментариев к заявке
-app.get('/api/tickets/:id/comments', authMiddleware, (req, res) => {
-    db.all(`SELECT * FROM comments WHERE ticket_id = ? ORDER BY created_at ASC`, [req.params.id], (err, comments) => {
-        if (err) {
-            return res.status(500).json({ error: 'Ошибка получения комментариев' });
+app.get('/api/tickets/:id/comments', authMiddleware, async (req, res) => {
+    try {
+        const ticketNumericId = parseInt(req.params.id);
+        
+        const ticket = await ticketsCollection.findOne({ numeric_id: ticketNumericId });
+        if (!ticket) {
+            return res.status(404).json({ error: 'Заявка не найдена' });
         }
+        
+        if (!req.user.isAdmin && ticket.branch_id !== req.user.id) {
+            return res.status(403).json({ error: 'Нет доступа' });
+        }
+        
+        const comments = await commentsCollection.find({ ticket_numeric_id: ticketNumericId })
+            .sort({ created_at: 1 })
+            .toArray();
+        
         res.json(comments);
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка получения комментариев' });
+    }
 });
 
-// Добавление комментария (для заведующих)
-app.post('/api/tickets/:id/comments', authMiddleware, (req, res) => {
+// Добавление комментария
+app.post('/api/tickets/:id/comments', authMiddleware, async (req, res) => {
     const { comment } = req.body;
+    const ticketNumericId = parseInt(req.params.id);
     
     if (!comment || comment.trim() === '') {
         return res.status(400).json({ error: 'Введите комментарий' });
     }
     
-    // Проверяем, имеет ли пользователь доступ к этой заявке
-    let query = `SELECT * FROM tickets WHERE id = ?`;
-    let params = [req.params.id];
-    
-    if (!req.user.isAdmin) {
-        query += ` AND branch_id = ?`;
-        params.push(req.user.id);
-    }
-    
-    db.get(query, params, (err, ticket) => {
-        if (err || !ticket) {
-            return res.status(403).json({ error: 'Нет доступа к этой заявке' });
+    try {
+        const ticket = await ticketsCollection.findOne({ numeric_id: ticketNumericId });
+        if (!ticket) {
+            return res.status(404).json({ error: 'Заявка не найдена' });
         }
         
-        db.run(`INSERT INTO comments (ticket_id, user_name, comment) VALUES (?, ?, ?)`,
-            [req.params.id, req.user.name, comment], function(err) {
-            if (err) {
-                return res.status(500).json({ error: 'Ошибка добавления комментария' });
-            }
-            
-            // Записываем в историю
-            addToHistory(req.params.id, 'comment', null, comment, req.user.name);
-            
-            res.json({ id: this.lastID, message: 'Комментарий добавлен' });
+        if (!req.user.isAdmin && ticket.branch_id !== req.user.id) {
+            return res.status(403).json({ error: 'Нет доступа' });
+        }
+        
+        await commentsCollection.insertOne({
+            ticket_numeric_id: ticketNumericId,
+            user_name: req.user.name,
+            comment: comment,
+            created_at: new Date()
         });
-    });
+        
+        await addToHistory(ticketNumericId, 'comment', null, comment, req.user.name);
+        
+        res.json({ message: 'Комментарий добавлен' });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка добавления комментария' });
+    }
 });
 
 // Получение истории заявки
-app.get('/api/tickets/:id/history', authMiddleware, (req, res) => {
-    // Проверяем доступ
-    let query = `SELECT * FROM tickets WHERE id = ?`;
-    let params = [req.params.id];
-    
-    if (!req.user.isAdmin) {
-        query += ` AND branch_id = ?`;
-        params.push(req.user.id);
-    }
-    
-    db.get(query, params, (err, ticket) => {
-        if (err || !ticket) {
-            return res.status(403).json({ error: 'Нет доступа к этой заявке' });
+app.get('/api/tickets/:id/history', authMiddleware, async (req, res) => {
+    try {
+        const ticketNumericId = parseInt(req.params.id);
+        
+        const ticket = await ticketsCollection.findOne({ numeric_id: ticketNumericId });
+        if (!ticket) {
+            return res.status(404).json({ error: 'Заявка не найдена' });
         }
         
-        db.all(`
-            SELECT * FROM ticket_history 
-            WHERE ticket_id = ? 
-            ORDER BY created_at ASC
-        `, [req.params.id], (err, history) => {
-            if (err) {
-                return res.status(500).json({ error: 'Ошибка получения истории' });
-            }
-            res.json(history);
-        });
-    });
+        if (!req.user.isAdmin && ticket.branch_id !== req.user.id) {
+            return res.status(403).json({ error: 'Нет доступа' });
+        }
+        
+        const history = await historyCollection.find({ ticket_numeric_id: ticketNumericId })
+            .sort({ created_at: 1 })
+            .toArray();
+        
+        res.json(history);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка получения истории' });
+    }
 });
 
-// Получение статистики (только для админа)
-app.get('/api/stats', authMiddleware, (req, res) => {
+// Получение статистики
+app.get('/api/stats', authMiddleware, async (req, res) => {
     if (!req.user.isAdmin) {
         return res.status(403).json({ error: 'Доступ запрещён' });
     }
     
-    db.all(`SELECT 
-        COUNT(*) as total,
-        SUM(CASE WHEN status = 'new' THEN 1 ELSE 0 END) as new_count,
-        SUM(CASE WHEN status = 'in_progress' THEN 1 ELSE 0 END) as in_progress_count,
-        SUM(CASE WHEN status = 'completed' THEN 1 ELSE 0 END) as completed_count,
-        SUM(CASE WHEN priority = 'high' THEN 1 ELSE 0 END) as high_priority_count,
-        SUM(CASE WHEN priority = 'medium' THEN 1 ELSE 0 END) as medium_priority_count,
-        SUM(CASE WHEN priority = 'low' THEN 1 ELSE 0 END) as low_priority_count
-        FROM tickets`, [], (err, stats) => {
-        if (err) {
-            return res.status(500).json({ error: 'Ошибка получения статистики' });
-        }
+    try {
+        const tickets = await ticketsCollection.find({}).toArray();
+        
+        const total = tickets.length;
+        const new_count = tickets.filter(t => t.status === 'new').length;
+        const in_progress_count = tickets.filter(t => t.status === 'in_progress').length;
+        const completed_count = tickets.filter(t => t.status === 'completed').length;
+        const cancelled_count = tickets.filter(t => t.status === 'cancelled').length;
+        const high_priority_count = tickets.filter(t => t.priority === 'high').length;
+        const medium_priority_count = tickets.filter(t => t.priority === 'medium').length;
+        const low_priority_count = tickets.filter(t => t.priority === 'low').length;
         
         // Статистика по категориям
-        db.all(`SELECT category, COUNT(*) as count FROM tickets GROUP BY category`, [], (err, categoryStats) => {
-            res.json({
-                ...stats[0],
-                by_category: categoryStats
-            });
+        const categoryMap = {};
+        tickets.forEach(t => {
+            const cat = t.category || 'other';
+            categoryMap[cat] = (categoryMap[cat] || 0) + 1;
         });
-    });
+        const by_category = Object.entries(categoryMap).map(([category, count]) => ({ category, count }));
+        
+        res.json({
+            total,
+            new_count,
+            in_progress_count,
+            completed_count,
+            cancelled_count,
+            high_priority_count,
+            medium_priority_count,
+            low_priority_count,
+            by_category
+        });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка получения статистики' });
+    }
 });
 
-// Получение списка филиалов (для админа)
-app.get('/api/branches', authMiddleware, (req, res) => {
+// Получение списка филиалов
+app.get('/api/branches', authMiddleware, async (req, res) => {
     if (!req.user.isAdmin) {
         return res.status(403).json({ error: 'Доступ запрещён' });
     }
     
-    db.all(`SELECT id, name, login, email, is_admin FROM branches`, [], (err, branches) => {
-        if (err) {
-            return res.status(500).json({ error: 'Ошибка получения списка филиалов' });
-        }
-        res.json(branches);
-    });
+    try {
+        const branches = await branchesCollection.find({})
+            .project({ _id: 1, name: 1, login: 1, email: 1, is_admin: 1 })
+            .toArray();
+        
+        const branchesWithId = branches.map(b => ({
+            id: b._id.toString(),
+            name: b.name,
+            login: b.login,
+            email: b.email,
+            is_admin: b.is_admin
+        }));
+        
+        res.json(branchesWithId);
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка получения списка филиалов' });
+    }
 });
 
-// Обновление email филиала (только для админа)
-app.put('/api/branches/:id/email', authMiddleware, (req, res) => {
+// Обновление email филиала
+app.put('/api/branches/:id/email', authMiddleware, async (req, res) => {
     if (!req.user.isAdmin) {
         return res.status(403).json({ error: 'Доступ запрещён' });
     }
     
     const { email } = req.body;
-    db.run(`UPDATE branches SET email = ? WHERE id = ?`, [email, req.params.id], function(err) {
-        if (err) {
-            return res.status(500).json({ error: 'Ошибка обновления email' });
-        }
+    
+    try {
+        const branchId = new ObjectId(req.params.id);
+        await branchesCollection.updateOne(
+            { _id: branchId },
+            { $set: { email: email } }
+        );
         res.json({ message: 'Email обновлён' });
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка обновления email' });
+    }
 });
 
 // Экспорт в Excel
-app.get('/api/export', authMiddleware, (req, res) => {
+app.get('/api/export', authMiddleware, async (req, res) => {
     if (!req.user.isAdmin) {
         return res.status(403).json({ error: 'Доступ запрещён' });
     }
     
     const { status, priority, branch, search } = req.query;
-    let query = `SELECT * FROM tickets`;
-    let params = [];
-    let conditions = [];
+    let filter = {};
     
-    if (status && status !== 'all') {
-        conditions.push(`status = ?`);
-        params.push(status);
-    }
+    if (status && status !== 'all') filter.status = status;
+    if (priority && priority !== 'all') filter.priority = priority;
+    if (branch && branch.trim()) filter.branch_name = { $regex: branch, $options: 'i' };
+    if (search && search.trim()) filter.problem = { $regex: search, $options: 'i' };
     
-    if (priority && priority !== 'all') {
-        conditions.push(`priority = ?`);
-        params.push(priority);
-    }
-    
-    if (branch && branch.trim()) {
-        conditions.push(`branch_name LIKE ?`);
-        params.push(`%${branch}%`);
-    }
-    
-    if (search && search.trim()) {
-        conditions.push(`problem LIKE ?`);
-        params.push(`%${search}%`);
-    }
-    
-    if (conditions.length) {
-        query += ` WHERE ` + conditions.join(' AND ');
-    }
-    
-    query += ` ORDER BY created_at DESC`;
-    
-    db.all(query, params, (err, tickets) => {
-        if (err) {
-            return res.status(500).json({ error: 'Ошибка получения данных' });
-        }
+    try {
+        let tickets = await ticketsCollection.find(filter).toArray();
         
         const categoryMap = {
             'computer': 'Компьютер/ноутбук',
@@ -582,13 +612,13 @@ app.get('/api/export', authMiddleware, (req, res) => {
         };
         
         const excelData = tickets.map(t => ({
-            '№': t.id,
+            '№': t.numeric_id,
             'Филиал': t.branch_name,
             'Категория': categoryMap[t.category] || t.category,
             'Приоритет': priorityMap[t.priority] || t.priority,
             'Статус': statusMap[t.status] || t.status,
             'Описание проблемы': t.problem,
-            'Дата создания': new Date(t.created_at).toLocaleString('ru-RU'),
+            'Дата создания': t.created_at ? new Date(t.created_at).toLocaleString('ru-RU') : '',
             'Фото': t.photo_path ? `${process.env.APP_URL || 'http://localhost:3000'}${t.photo_path}` : 'Нет'
         }));
         
@@ -601,43 +631,32 @@ app.get('/api/export', authMiddleware, (req, res) => {
         const wb = XLSX.utils.book_new();
         XLSX.utils.book_append_sheet(wb, ws, 'Zayavki');
         
-        const statsData = [
-            { 'Показатель': 'Vsego zayavok', 'Значение': tickets.length },
-            { 'Показатель': 'Novyh', 'Значение': tickets.filter(t => t.status === 'new').length },
-            { 'Показатель': 'V rabote', 'Значение': tickets.filter(t => t.status === 'in_progress').length },
-            { 'Показатель': 'Vypolneno', 'Значение': tickets.filter(t => t.status === 'completed').length },
-            { 'Показатель': 'Otmeneno', 'Значение': tickets.filter(t => t.status === 'cancelled').length },
-            { 'Показатель': 'Vysokiy prioritet', 'Значение': tickets.filter(t => t.priority === 'high').length },
-        ];
-        const wsStats = XLSX.utils.json_to_sheet(statsData);
-        XLSX.utils.book_append_sheet(wb, wsStats, 'Statistika');
-        
         const buffer = XLSX.write(wb, { type: 'buffer', bookType: 'xlsx' });
         
-        // ИСПРАВЛЕНО: имя файла только из латиницы, цифр и знаков _.-
         const now = new Date();
-        const year = now.getFullYear();
-        const month = String(now.getMonth() + 1).padStart(2, '0');
-        const day = String(now.getDate()).padStart(2, '0');
-        const hours = String(now.getHours()).padStart(2, '0');
-        const minutes = String(now.getMinutes()).padStart(2, '0');
-        const seconds = String(now.getSeconds()).padStart(2, '0');
-        const filename = `tickets_${year}-${month}-${day}_${hours}-${minutes}-${seconds}.xlsx`;
+        const filename = `tickets_${now.getFullYear()}-${now.getMonth()+1}-${now.getDate()}_${now.getHours()}-${now.getMinutes()}-${now.getSeconds()}.xlsx`;
         
-        // Безопасная установка заголовка (только латиница в имени файла)
         res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
         res.send(buffer);
-    });
+    } catch (err) {
+        console.error(err);
+        res.status(500).json({ error: 'Ошибка экспорта' });
+    }
 });
 
-// Ping для поддержания активности
+// Ping
 app.get('/ping', (req, res) => {
     res.json({ status: 'ok', timestamp: new Date().toISOString() });
 });
 
-// Запуск сервера
-app.listen(PORT, () => {
-    console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
-    console.log(`📧 Почтовые уведомления: ${process.env.NOTIFY_EMAIL || 'не настроены'}`);
-});
+// ============ ЗАПУСК СЕРВЕРА ============
+async function startServer() {
+    await connectDB();
+    app.listen(PORT, () => {
+        console.log(`🚀 Сервер запущен на http://localhost:${PORT}`);
+        console.log(`📧 Почтовые уведомления: ${process.env.NOTIFY_EMAIL || 'не настроены'}`);
+    });
+}
+
+startServer();
